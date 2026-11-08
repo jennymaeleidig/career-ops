@@ -1,0 +1,54 @@
+{
+  "status": "ok",
+  "records": [
+    {
+      "Columns": [
+        { "FieldNameOrPath": "Name", "Value": "Programs Director" },
+        { "FieldNameOrPath": "Job_Title__c", "Value": "Programs Director" },
+        { "FieldNameOrPath": "Posting_Organization__r.Name", "Value": "Acme Nonprofit" },
+        { "FieldNameOrPath": "Location__c", "Value": "Richmond, VA" },
+        {
+          "FieldNameOrPath": "Job_Post_Description__c",
+          "Value": "<p><strong>About Acme: </strong>we run <em>community &amp; school</em> programs.</p><p>Lead the team.</p>"
+        },
+        { "FieldNameOrPath": "Approval_Date__c", "Value": "Mon Oct 26 00:00:00 GMT 2026" },
+        { "FieldNameOrPath": "Approval_Date__c,\"M/d/yyyy\"", "Value": "1/1/1999" },
+        { "FieldNameOrPath": "More_Info_URL__c", "Value": "https://acme.example.org/careers/programs-director" },
+        { "FieldNameOrPath": "More_Info_Email__c", "Value": "" },
+        { "FieldNameOrPath": "Job_Type__c", "Value": "Full Time" },
+        { "FieldNameOrPath": "Job_Classification__c", "Value": "Management" },
+        { "FieldNameOrPath": "Job_Posting_Slug__c", "Value": "Programs-Director" },
+        { "FieldNameOrPath": "Salary_calculated__c", "Value": "$65,000 – $100,000 / year" },
+        { "FieldNameOrPath": "Id", "Value": "a23Nw000005L2LhIAK" }
+      ]
+    },
+    {
+      "Columns": [
+        { "FieldNameOrPath": "Name", "Value": "Community Engagement Coordinator" },
+        { "FieldNameOrPath": "Job_Title__c", "Value": "Community Engagement Coordinator" },
+        { "FieldNameOrPath": "Posting_Organization__r.Name", "Value": "ExampleCo" },
+        { "FieldNameOrPath": "Location__c", "Value": "Henrico County" },
+        { "FieldNameOrPath": "Job_Post_Description__c", "Value": "<div>Part-time outreach role.</div>" },
+        { "FieldNameOrPath": "Approval_Date__c", "Value": "Thu Oct 15 00:00:00 GMT 2026" },
+        { "FieldNameOrPath": "More_Info_URL__c", "Value": "" },
+        { "FieldNameOrPath": "Job_Posting_Slug__c", "Value": "Community-Engagement-Coordinator" },
+        { "FieldNameOrPath": "Salary_calculated__c", "Value": "$17.75 – $20.00 / hour" },
+        { "FieldNameOrPath": "Id", "Value": "a23Nw000005L2LiIBK" }
+      ]
+    },
+    {
+      "Columns": [
+        { "FieldNameOrPath": "Name", "Value": "" },
+        { "FieldNameOrPath": "Job_Title__c", "Value": "" },
+        { "FieldNameOrPath": "Posting_Organization__r.Name", "Value": "BigCo" },
+        { "FieldNameOrPath": "Location__c", "Value": "Richmond" },
+        { "FieldNameOrPath": "Id", "Value": "a23Nw000005L2LjICK" }
+      ]
+    }
+  ],
+  "columns": [],
+  "dynamicFacetsData": [],
+  "dynamicFacetsDataTop": [],
+  "recordsDeleted": [],
+  "lastFetchTime": "2026-10-28T00:17:45.1908048Z"
+}
