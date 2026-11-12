@@ -1,3 +1,5 @@
+import { statusToken } from "./pipeline-sankey.mjs";
+
 // Carry only the list's own filters through a report URL. Return destinations
 // remain fixed to /pipeline; no arbitrary "returnTo" URL or browser storage.
 const FILTER_KEYS = ["tab", "min", "sort", "dir", "q"];
@@ -22,6 +24,17 @@ export function pipelineQuery(params, search) {
   return query.toString();
 }
 
+/** Detail URL for one tracker row. `search` is the text in the box right now,
+ * which can be ahead of the deferred value baked into the row link.
+ * @param {string} n
+ * @param {string | Record<string, string | string[] | undefined>} params
+ * @param {string} search
+ */
+export function trackerDetailHref(n, params, search) {
+  const query = pipelineQuery(params, search);
+  return `/pipeline/${encodeURIComponent(n)}${query ? `?${query}` : ""}`;
+}
+
 // INBOX (the triage queue) is the default tab; the rest filter the tracker.
 export const PIPELINE_TABS = /** @type {const} */ ([
   "INBOX",
@@ -36,7 +49,26 @@ export const PIPELINE_TABS = /** @type {const} */ ([
   "REJECTED",
   "DISCARDED",
   "SKIP",
+  "OTHER",
 ]);
+
+const RESIDUAL_TABS = new Set(["INBOX", "ALL", "OTHER"]);
+
+const STAGE_TABS = new Set(PIPELINE_TABS.filter((tab) => !RESIDUAL_TABS.has(tab)));
+
+/**
+ * A row sits on the tab named by the Analytics sankey's statusToken, so tab
+ * counts and sankey leaves agree: "Not evaluated" is OTHER, and a dated
+ * "Aplicado 2026-08-20" is APPLIED. OTHER is every token that is no stage.
+ * @param {string} status
+ * @param {string} tab
+ * @returns {boolean}
+ */
+export function rowOnPipelineTab(status, tab) {
+  const token = statusToken(status);
+  if (tab === "OTHER") return !STAGE_TABS.has(token);
+  return token === tab;
+}
 
 /**
  * The tab a `?tab=` value selects. The server page and the client view both

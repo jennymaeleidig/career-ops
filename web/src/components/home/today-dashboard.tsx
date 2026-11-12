@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Bell, CircleHelp, Sparkles, ArrowRight } from "lucide-react";
+import { Bell, CircleHelp, Sparkles, ArrowRight, Undo2, X } from "lucide-react";
 import { instrumentSerif } from "@/lib/fonts";
 import { HeroGlow } from "@/components/hero-glow";
 import type { Application, InboxJob } from "@/lib/career-ops";
@@ -13,11 +13,17 @@ import { FollowUpCard, type FollowUp } from "@/components/home/follow-up-card";
 import { DecisionCard } from "@/components/home/decision-card";
 import type { CardReason } from "@/lib/machine-summary.mjs";
 import { QuickEvaluate } from "@/components/quick-evaluate";
+import { LinkedInPaste } from "@/components/linkedin-paste";
 import { FollowupsDueSectionSkeleton } from "@/components/page-loading-skeletons";
 import { scoreNum } from "@/lib/format";
+import { undoStatus } from "@/lib/pipeline-status.mjs";
 import { pickAwaitingDecision, groupAwaiting } from "@/lib/home/awaiting.mjs";
+import { orderTodayQueue } from "@/lib/home/today-queue.mjs";
+import { selectDueFollowups } from "@/lib/core/followup-view.mjs";
 import { companyPresentation } from "@/lib/company-presentation.mjs";
+import { ApplyNext } from "@/components/apply-next";
 import { resolveHeroState, mayClaimAllClear, showsQueue, missingSourceLabel, displayCounts } from "@/lib/home/hero-state.mjs";
+import { homeFollowupRemainder } from "@/lib/home/followups-shown.mjs";
 
 // The retention "Today": a dual-loop action queue (the maintainer's
 // "N new matches this week · M follow-ups due"). SUPPLY loop = fresh free-scan
@@ -29,7 +35,7 @@ export function TodayDashboard({
   reasons,
   legitimacy,
   inbox,
-  inBetween,
+  applyFacts = {},
 }: {
   applications: Application[];
   reasons: Record<string, CardReason>;
@@ -37,6 +43,7 @@ export function TodayDashboard({
   legitimacy: Record<string, string>;
   inbox: Pick<InboxJob, "url" | "done">[];
   inBetween: boolean;
+  applyFacts?: Record<string, { pdfOnDisk: boolean; postingUrl: string }>;
 }) {
   const [followups, setFollowups] = useState<FollowUp[]>([]);
   const [overdue, setOverdue] = useState(0);
@@ -48,6 +55,7 @@ export function TodayDashboard({
   const [freshCount, setFreshCount] = useState(0);
   const [freshLoading, setFreshLoading] = useState(true);
   const [freshError, setFreshError] = useState(false);
+  const [decisionUndo, setDecisionUndo] = useState<{ n: string; label: string; busy?: boolean; error?: string } | null>(null);
   const requestGeneration = useRef(0);
   const router = useRouter();
   const dateLabel = useMemo(() => new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" }), []);
@@ -112,6 +120,24 @@ export function TodayDashboard({
     };
   }, [refetch, router]);
 
+  // A Skip or Applied click removes its card on refresh, so the undo lives here.
+  useEffect(() => {
+    if (!decisionUndo || decisionUndo.busy || decisionUndo.error) return;
+    const t = setTimeout(() => setDecisionUndo((current) => (current === decisionUndo ? null : current)), 5000);
+    return () => clearTimeout(t);
+  }, [decisionUndo]);
+
+  const undoDecision = async (notice: { n: string; label: string }) => {
+    setDecisionUndo({ ...notice, busy: true });
+    try {
+      await undoStatus(notice.n);
+      setDecisionUndo(null);
+      router.refresh();
+    } catch (cause) {
+      setDecisionUndo({ ...notice, error: cause instanceof Error ? cause.message : "Could not undo. Please try again." });
+    }
+  };
+
   // Awaiting decision: scored (Evaluated) but no terminal status yet. The
   // ordering lives in lib/home/awaiting.mjs so it can be tested — see the file
   // for why "first six in the array" was a bug waiting for #3529.
@@ -142,7 +168,16 @@ export function TodayDashboard({
   // place when a source fails, so `overdue` can still hold a number from before
   // the outage. See displayCounts().
   const shown = displayCounts({ followupsError, freshError, overdue, newThisWeek });
+  const followupRest = homeFollowupRemainder(followups.length, overdue);
   const inboxUrls = useMemo(() => new Set(inbox.map((j) => j.url)), [inbox]);
+  const dueFollowups = useMemo(
+    () => selectDueFollowups(followups, Math.max(followups.length, 1)),
+    [followups],
+  );
+  const queueLead = orderTodayQueue([
+    { kind: "follow-up", due: true, count: shown.overdue },
+    { kind: "match", due: false, count: shown.newThisWeek },
+  ]).filter((item) => item.count > 0);
 
   return (
     <div className="mx-auto max-w-5xl px-6 py-10 max-sm:pb-24">
@@ -163,21 +198,24 @@ export function TodayDashboard({
               <>You&apos;re all caught up.</>
             ) : showsQueue(heroState) ? (
               <>
-                {shown.newThisWeek > 0 && (
-                  <>
-                    <span className="text-brand tabular-nums">{shown.newThisWeek}</span> new match{shown.newThisWeek === 1 ? "" : "es"} this week
-                  </>
-                )}
-                {shown.newThisWeek > 0 && shown.overdue > 0 && <span className="text-faint"> · </span>}
-                {shown.overdue > 0 && (
-                  <>
-                    <span className="text-brand tabular-nums">{shown.overdue}</span> follow-up{shown.overdue === 1 ? "" : "s"} due
-                  </>
-                )}
+                {queueLead.map((item, index) => (
+                  <span key={item.kind}>
+                    {index > 0 && <span className="text-faint"> · </span>}
+                    {item.kind === "follow-up" ? (
+                      <>
+                        <span className="text-brand-text tabular-nums">{item.count}</span> follow-up{item.count === 1 ? "" : "s"} due
+                      </>
+                    ) : (
+                      <>
+                        <span className="text-brand-text tabular-nums">{item.count}</span> new match{item.count === 1 ? "" : "es"} this week
+                      </>
+                    )}
+                  </span>
+                ))}
                 {/* queue-partial with work known only from the server snapshot:
                     both loops are down but the pipeline still has decisions
                     waiting, so the queue is real while neither count is. */}
-                {shown.newThisWeek === 0 && shown.overdue === 0 && <>Your queue is waiting.</>}
+                {queueLead.length === 0 && <>Your queue is waiting.</>}
               </>
             ) : (
               <>Your queue is waiting.</>
@@ -198,18 +236,18 @@ export function TodayDashboard({
             <Link href="/explore" className="inline-flex items-center gap-2 rounded-full bg-brand px-5 py-2.5 text-sm font-medium text-brand-foreground transition hover:bg-brand-200 max-sm:min-h-[44px]">
               Find new roles <ArrowRight className="size-4" />
             </Link>
-            <Link href="/pipeline" className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2.5 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand max-sm:min-h-[44px]">
+            <Link href="/pipeline" className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2.5 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand-text max-sm:min-h-[44px]">
               Open pipeline
             </Link>
           </div>
-          {inBetween && <QuickEvaluate />}
+          <QuickEvaluate />
         </div>
       </section>
 
       {dataError && !dataLoading && (
         <div role="alert" className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-surface/40 px-5 py-4 text-sm text-muted">
           <p>{missingSources} could not be loaded.</p>
-          <button type="button" onClick={refetch} className="font-medium text-brand hover:underline">Retry updates</button>
+          <button type="button" onClick={refetch} className="font-medium text-brand-text hover:underline">Retry updates</button>
         </div>
       )}
 
@@ -218,16 +256,21 @@ export function TodayDashboard({
         <FollowupsDueSectionSkeleton />
       ) : followupsError ? (
         null
-      ) : followups.length > 0 ? (
+      ) : dueFollowups.length > 0 ? (
         <Section icon={Bell} title="Follow-ups due" hint="Keep your applications alive — a nudge beats silence">
           <div className="grid gap-2.5">
-            {followups.map((f) => (
+            {dueFollowups.map((f) => (
               // Refetch (not a local decrement) so the parent's followups/upcoming
               // stay in sync with the server. Logging the LAST due item must flip this
               // section over to "Upcoming" instead of leaving it empty.
               <FollowUpCard key={`${f.num}-${f.company}`} followup={f} onLogged={refetch} />
             ))}
           </div>
+          {followupRest.hidden > 0 && (
+            <Link href="/followups" className="mt-3 inline-flex items-center text-sm text-muted transition hover:text-brand-text max-sm:min-h-[44px]">
+              See all {followupRest.total} {followupRest.total === 1 ? "follow-up" : "follow-ups"}
+            </Link>
+          )}
         </Section>
       ) : null}
 
@@ -238,7 +281,7 @@ export function TodayDashboard({
               <li key={`${item.num ?? item.company}-${item.nextFollowupDate ?? ""}`}>
                 <Link
                   href={item.num != null ? `/pipeline/${item.num}` : "/followups"}
-                  className="text-sm text-muted hover:text-brand"
+                  className="text-sm text-muted hover:text-brand-text"
                 >
                   <span className="font-medium text-foreground">{item.company}</span>
                   {item.role ? <span> · {item.role}</span> : null}
@@ -254,19 +297,28 @@ export function TodayDashboard({
       {awaiting.length > 0 && (
         <Section icon={CircleHelp} title="Awaiting your decision" hint="Best score first">
           {recommended.length > 0 && (
-            <Link
-              href={`/pipeline/${recommended[0].n}`}
-              className="mb-3 inline-flex items-center gap-2 rounded-full bg-brand px-4 py-2 text-sm font-medium text-brand-foreground transition hover:bg-brand-200 max-sm:min-h-[44px]"
-            >
-              Apply next · {companyPresentation(recommended[0]).label} {recommended[0].score} <ArrowRight className="size-4" />
-            </Link>
+            <ApplyNext
+              n={recommended[0].n}
+              company={companyPresentation(recommended[0]).label}
+              score={recommended[0].score}
+              pdfOnDisk={applyFacts[recommended[0].n]?.pdfOnDisk ?? false}
+              postingUrl={applyFacts[recommended[0].n]?.postingUrl ?? ""}
+            />
           )}
           {awaitingGroups.map(([label, group]) => (
             <div key={label} className="mb-3">
               <h3 className="mb-2 text-xs font-medium text-faint">{label}</h3>
               <div className="grid gap-2.5 sm:grid-cols-2">
                 {group.map((a) => (
-                  <DecisionCard key={a.n} app={a} reason={reasons[a.n]} />
+                  <DecisionCard
+                    key={a.n}
+                    app={a}
+                    reason={reasons[a.n]}
+                    onDecided={(status) => {
+                      const company = companyPresentation(a).label;
+                      setDecisionUndo({ n: a.n, label: status === "Applied" ? `Marked ${company} applied` : `Skipped ${company}` });
+                    }}
+                  />
                 ))}
               </div>
             </div>
@@ -283,7 +335,7 @@ export function TodayDashboard({
             ))}
           </div>
           {fresh.length > 6 && (
-            <Link href="/explore?view=fresh" className="mt-3 inline-flex items-center text-sm text-muted transition hover:text-brand max-sm:min-h-[44px]">
+            <Link href="/explore?view=fresh" className="mt-3 inline-flex items-center text-sm text-muted transition hover:text-brand-text max-sm:min-h-[44px]">
               See all {freshCount} →
             </Link>
           )}
@@ -292,10 +344,31 @@ export function TodayDashboard({
 
       {allClear && upcoming.length === 0 && (
         <div className="mt-8 rounded-2xl border border-border bg-surface/30 px-6 py-10 text-center">
-          <Sparkles className="mx-auto size-6 text-brand" />
+          <Sparkles className="mx-auto size-6 text-brand-text" />
           <p className="mx-auto mt-3 max-w-md text-sm text-muted">
-            Nothing needs you right now. Run a <Link href="/explore" className="text-brand hover:underline">free scan</Link> to surface this week&apos;s roles, or check your <Link href="/pipeline" className="text-brand hover:underline">pipeline</Link>.
+            Nothing needs you right now. Run a <Link href="/explore" className="text-brand-text hover:underline">free scan</Link> to surface this week&apos;s roles, or check your <Link href="/pipeline" className="text-brand-text hover:underline">pipeline</Link>.
           </p>
+        </div>
+      )}
+
+      <LinkedInPaste />
+
+      {decisionUndo && (
+        <div className="fixed inset-x-0 bottom-32 z-40 flex justify-center px-4 sm:bottom-6">
+          <div className="inline-flex max-w-full flex-wrap items-center gap-3 rounded-2xl border border-border bg-surface px-4 py-2 text-sm shadow-lg">
+            <div className="min-w-0 flex-1 break-words">
+              <span className="text-muted" role="status">{decisionUndo.label}</span>
+              {decisionUndo.error && <p role="alert" className="text-red-700 dark:text-red-400">{decisionUndo.error}</p>}
+            </div>
+            <button type="button" onClick={() => void undoDecision(decisionUndo)} disabled={decisionUndo.busy} aria-busy={Boolean(decisionUndo.busy)} className="inline-flex shrink-0 items-center gap-1 font-medium text-brand-text disabled:opacity-50 max-sm:min-h-[44px]">
+              <Undo2 className="size-3.5" /> {decisionUndo.busy ? "Undoing…" : decisionUndo.error ? "Retry undo" : "Undo"}
+            </button>
+            {decisionUndo.error && (
+              <button type="button" onClick={() => setDecisionUndo(null)} aria-label="Dismiss" className="inline-flex shrink-0 items-center text-faint hover:text-muted max-sm:min-h-[44px] max-sm:min-w-[44px] max-sm:justify-center">
+                <X className="size-3.5" />
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -306,7 +379,7 @@ function Section({ icon: Icon, title, hint, children }: { icon: React.ComponentT
   return (
     <section className="mt-10">
       <div className="mb-3 flex items-center gap-2">
-        <Icon className="size-4 text-brand" />
+        <Icon className="size-4 text-brand-text" />
         <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">{title}</h2>
         <span className="text-xs text-faint">· {hint}</span>
       </div>
