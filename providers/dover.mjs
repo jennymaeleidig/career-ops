@@ -187,7 +187,15 @@ export default {
       if (page > 0) await sleep(INTER_PAGE_DELAY_MS, ctx);
       let json;
       try {
-        json = await fetchJsonWithRetry(ctx, apiUrlFor(board.board, page), { redirect: 'error' }, RETRY_POLICY);
+        // A status-less failure is retryable. verify-portals probes with
+        // ctx.maxPages set and wants that failure back at once, so a probe
+        // gets no retries. A normal scan keeps RETRY_POLICY (two retries).
+        json = await fetchJsonWithRetry(
+          ctx,
+          apiUrlFor(board.board, page),
+          { redirect: 'error' },
+          probing ? { retries: 0 } : RETRY_POLICY,
+        );
       } catch (err) {
         if (probing || page === 0) throw err;
         const attempts = err?.attempts ?? RETRY_POLICY.retries + 1;
@@ -206,6 +214,12 @@ export default {
     if (stopReason === STOP_REASON.COMPLETE && page === pagesToFetch && pagesToFetch === maxPages) {
       stopReason = STOP_REASON.CAP;
       console.error(`⚠️  dover: ${entry.name} truncated at max_pages=${maxPages} (${jobs.length} jobs) — raise max_pages on this entry for more`);
+    }
+    // Canonical partial-read signal (lib/board-truncation.mjs): scan.mjs logs
+    // the board `partial`, not `reachable`. A probe never gets here with
+    // either reason (it throws on a failure and stops below the cap).
+    if (!probing && (stopReason === STOP_REASON.CAP || stopReason === STOP_REASON.FETCH_ERROR)) {
+      /** @type {any} */ (jobs).truncated = { reason: stopReason === STOP_REASON.CAP ? 'page-cap' : 'fetch-error', fetched: jobs.length };
     }
 
     return jobs;

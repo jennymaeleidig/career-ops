@@ -207,6 +207,8 @@ try {
   else fail(`dover.fetch() made ${hugeCalls} calls, ${huge.length} jobs`);
   if (hugeErrors.some((e) => /raise max_pages/.test(e))) pass('dover.fetch() warns to raise max_pages on a real cap stop');
   else fail(`dover.fetch() cap warning missing: ${JSON.stringify(hugeErrors)}`);
+  if (huge.truncated?.reason === 'page-cap' && huge.truncated?.fetched === 1500) pass('dover.fetch() marks a capped board with jobs.truncated');
+  else fail(`dover.fetch() cap flag: ${JSON.stringify(huge.truncated)}`);
 
   // A short page that is also the last allowed page is a natural end, not a cap.
   let lastCalls = 0;
@@ -223,19 +225,29 @@ try {
   // Probe: ctx.maxPages: 1 → exactly one request; a rejection propagates unwrapped.
   let probeCalls = 0;
   let probeOpts = null;
-  await dover.fetch(big, { maxPages: 1, fetchJson: async (_u, o) => { probeCalls++; probeOpts = o; return full(0, 300); } });
+  const probed = await dover.fetch(big, { maxPages: 1, fetchJson: async (_u, o) => { probeCalls++; probeOpts = o; return full(0, 300); } });
+  if (probed.truncated) fail(`dover.fetch() flagged a probe as truncated: ${JSON.stringify(probed.truncated)}`);
+  else pass('dover.fetch() leaves a ctx.maxPages probe unflagged');
   if (probeCalls === 1 && probeOpts?.redirect === 'error') pass('dover.fetch() honors ctx.maxPages: 1 (one request, redirect:"error")');
   else fail(`dover.fetch() probe made ${probeCalls} calls, opts ${JSON.stringify(probeOpts)}`);
 
-  class FakeProbeBudget extends Error {}
+  // A plain Error has no status, so isRetryableError() treats it as retryable.
+  // The probe must still make exactly one call and rethrow that same error
+  // (providers/magneto.mjs's health-probe check).
+  const probeErr = new Error('budget');
+  let failProbeCalls = 0;
   let unwrapped = false;
   try {
-    await dover.fetch(big, { maxPages: 1, fetchJson: async () => { throw new FakeProbeBudget('budget'); } });
+    await dover.fetch(big, {
+      maxPages: 1,
+      sleep: async () => {},
+      fetchJson: async () => { failProbeCalls++; throw probeErr; },
+    });
   } catch (e) {
-    unwrapped = e instanceof FakeProbeBudget;
+    unwrapped = e === probeErr;
   }
-  if (unwrapped) pass('dover.fetch() propagates a ctx.fetch* rejection unwrapped while probing');
-  else fail('dover.fetch() must not swallow/rewrap a rejection while probing');
+  if (unwrapped && failProbeCalls === 1) pass('dover.fetch() propagates a status-less rejection unwrapped after exactly one call while probing');
+  else fail(`dover.fetch() probe failure: unwrapped=${unwrapped}, calls=${failProbeCalls}`);
 
   // A first-page failure is a broken board, not an empty one: it throws.
   let firstFailThrew = false;
@@ -257,6 +269,8 @@ try {
       throw Object.assign(new Error('HTTP 404'), { status: 404 });
     },
   }));
+  if (later.truncated?.reason === 'fetch-error' && later.truncated?.fetched === 300) pass('dover.fetch() marks a board cut short by a later-page failure with jobs.truncated');
+  else fail(`dover.fetch() fetch-error flag: ${JSON.stringify(later.truncated)}`);
   if (later.length === 300 && !laterErrors.some((e) => /raise max_pages/.test(e))) {
     pass('dover.fetch() keeps earlier pages on a later-page failure and does not warn "raise max_pages"');
   } else {

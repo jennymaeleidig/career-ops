@@ -1,5 +1,5 @@
 import { resolveColumns, parseTrackerRow, linkedReportNumbers, reportUrlForNumbers } from './tracker-parse.mjs';
-import { parseScanHistoryLine } from './lib/scan-history-columns.mjs';
+import { parseScanHistoryLine, scanHistoryDataLines } from './lib/scan-history-columns.mjs';
 
 // Portals write closure banners with typographic punctuation and accents:
 // WTTJ renders "Cette offre n’est plus disponible." with U+2019, not ASCII "'".
@@ -52,6 +52,11 @@ const HARD_EXPIRED_PATTERNS = [
   // rejected by \b alone (d->o is word->word).
   /this (?:job|role|position)(?: listing)? is closed\b(?!-)/i,
   /job (listing )?not found/i,
+  // Built In keeps a removed posting's full JD and its APPLY control, and says
+  // it is gone only in a banner under the title: "Sorry, this job was removed
+  // at 08:47 p.m. (UTC) on Wednesday, Oct 14, 2026" (#6327). The "sorry"
+  // keeps a sibling listing's "Job removed" badge from matching.
+  /\bsorry,? this job was removed\b/i,
   // A closure page whose only content is the sentence itself (#5000 defect 3):
   // "You can't view this job because it's not available at this time". It sits
   // in the hard tier because the sentence is a statement about THIS posting,
@@ -59,6 +64,12 @@ const HARD_EXPIRED_PATTERNS = [
   // renders. Spelled in the normalized alphabet like every pattern here.
   /can't view this job because it's not available/i,
   /the page you are looking for doesn.t exist/i,
+  // Eightfold career sites (e.g. netapp.eightfold.ai) render a closed req as a
+  // near-empty page whose only body is "The job you are looking for may have
+  // closed." Without this it read as insufficient_content (uncertain). Anchored
+  // on the subject "the job you are looking for" plus a closed verb, so prose
+  // that merely contains the word "closed" never matches.
+  /\bthe job you(?:'re| are) (?:looking|searching) for (?:may |might |could )?(?:have |has )?closed\b/i,
   /applications?\s+(?:(?:have|are|is)\s+)?closed/i,
   // "Was closed on 15 December" is a closure. "Will be closed on", "is to be
   // closed on" and "may be closed on" give a date still ahead, on a posting
@@ -92,6 +103,14 @@ const HARD_EXPIRED_PATTERNS = [
   /oferta (jest )?nieaktualna/i,
   /oferta archiwalna/i,
   /kandydaci nie sa juz akceptowani/i,
+  // Norwegian closure banners. arbeidsplassen.no, Jobbnorge and employer
+  // career sites can keep a closed posting's "Søk her" link, so this has to be
+  // a hard pattern (#6620). normalizeForMatch() folds å to a but not ø, hence
+  // [øo] and "gatt". Only the past tense and statements that the post is gone
+  // match: a deadline still ahead ("Søknadsfrist: 20.11.2026", "Søknadsfristen
+  // utløper 20. november") and "Stillingen vil bli besatt" never do.
+  /s[øo]knadsfristen (?:er utl[øo]pt|har gatt ut)/i,
+  /\b(?:stillingen|annonsen) er (?:ikke lenger (?:ledig|aktiv|tilgjengelig)|besatt|utl[øo]pt)\b/i,
 ];
 
 const LISTING_PAGE_PATTERNS = [
@@ -127,9 +146,10 @@ const SOFT_EXPIRED_PATTERNS = [
 // Anti-bot interstitials (Cloudflare "Just a moment...", hCaptcha walls, etc.)
 // render a tiny challenge page instead of the posting. Headless Playwright trips
 // these on portals like pracuj.pl. They must NOT be read as expired: the body is
-// short and lacks an apply control, so without this guard they fall through to
-// `insufficient_content` → expired, and scan --verify would write live jobs to
-// scan-history and permanently filter them out. Treat as uncertain instead.
+// short and lacks an apply control, so without this guard they fell through to
+// `insufficient_content`, which then read as expired, and scan --verify wrote
+// live jobs to scan-history and permanently filtered them out. Treat as
+// uncertain, with a code that names the wall.
 // Exported so browser scanners (scan-dayforce.mjs) recognise the same walls.
 export const BOT_CHALLENGE_PATTERNS = [
   /just a moment/i,
@@ -143,8 +163,30 @@ export const BOT_CHALLENGE_PATTERNS = [
   /please complete the security check/i,
 ];
 
+// Cloudflare titles its own interstitials, whatever the site's branding in the
+// body: "Just a moment..." for a managed challenge, "Attention Required! |
+// Cloudflare" for a block. A site-branded challenge body can be long, and a
+// reader that keeps a long page does not judge it by phrases a real posting may
+// quote, so it matches the title of the page that settled instead (#6713).
+// Callers check it only on an HTTP error: a challenge the browser passes
+// reloads the real posting under its own title.
+const CLOUDFLARE_INTERSTITIAL_TITLES = [
+  { re: /^just a moment\.{0,3}(?:…)?$/i, kind: 'challenge page' },
+  { re: /^attention required!?\s*\|\s*cloudflare$/i, kind: 'block page' },
+];
+
+/**
+ * @param {string} title - the rendered page title
+ * @returns {string|null} the interstitial kind, or null
+ */
+export function cloudflareInterstitial(title) {
+  const text = String(title ?? '').trim();
+  return CLOUDFLARE_INTERSTITIAL_TITLES.find(({ re }) => re.test(text))?.kind ?? null;
+}
+
 const EXPIRED_URL_PATTERNS = [
   /[?&]error=true/i,
+  /recruiting\.paylocity\.com\/recruiting\/jobs\/jobnotfound(?:\/|\?|#|$)/i,
 ];
 
 const APPLY_PATTERNS = [
@@ -183,6 +225,23 @@ const APPLY_PATTERNS = [
   // which is why the deadline check in classifyLiveness runs before the apply
   // control is read.
   /\bnop [dđ]on ung tuyen\b/i,
+  // Bulgarian (dev.bg, zaplata.bg, wherewework.bg): "Кандидатствай" /
+  // "Кандидатствайте сега". normalizeForMatch strips the breve, so "й" arrives
+  // as "и". \b only knows ASCII word characters, so Cyrillic edges use
+  // lookarounds instead.
+  /^кандидатства[ий](?:те)?(?![\p{L}\p{M}])/iu,
+  // jobtiger.bg labels Apply with the noun, wherewework.bg's external link with
+  // "Външно кандидатстване". Only at the start of the label: the noun also ends
+  // advice-article links ("…писмо за кандидатстване"), which are not Apply.
+  /^(?:външно )?кандидатстване(?![\p{L}\p{M}])/iu,
+  // Norwegian (arbeidsplassen.no, Jobbnorge, employer career sites): "Gå til
+  // søknad", "Send søknad", "Søk på stillingen", "Søk nå". normalizeForMatch
+  // turns "å" into "a" but leaves "ø" alone, so both are spelled here as they
+  // arrive. Bare "Søk" is not Apply: it is also every Norwegian site's search
+  // button ("Søk", "Søk etter stillinger"), so only the qualified labels count,
+  // and only at the start of the label.
+  /^(?:ga til|send) s[øo]knad(?:en)?(?![\p{L}\p{M}])/iu,
+  /^s[øo]k (?:pa (?:denne |den )?(?:stillingen|jobben)|stillingen|her|na)(?![\p{L}\p{M}])/iu,
 ];
 
 // CareerViet prints the application deadline in the posting's info block as
@@ -218,9 +277,13 @@ const MIN_CONTENT_CHARS = 300;
 // A job-detail URL almost always carries the posting's identity: a numeric req id
 // (Greenhouse, Workday pid, Microsoft) or a UUID (Lever, Ashby). If the requested
 // URL had one and the final URL lost it, the browser landed somewhere else.
+// liveness-browser.mjs reads the same id to tell the posting's own Apply link
+// from the site's links in the page chrome.
 const JOB_ID_TOKEN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{5,}/gi;
+// Its source, for the control walk, which runs in the page and cannot import it.
+export const JOB_ID_PATTERN = JOB_ID_TOKEN.source;
 
-function jobIdToken(url = '') {
+export function jobIdToken(url = '') {
   const matches = url.match(JOB_ID_TOKEN);
   return matches ? matches[matches.length - 1].toLowerCase() : null;
 }
@@ -247,8 +310,30 @@ function firstMatch(patterns, text = '') {
 //
 // Words are separated by a single space because normalizeForMatch() leaves one
 // character per run of whitespace; "\n" is not a space, so the clause stops there.
+// The Norwegian openers are spelled as normalizeForMatch() leaves them (når →
+// "nar", så → "sa"; ø is kept): public-sector postings routinely say "Når
+// søknadsfristen er utløpt, blir søkerlisten offentliggjort", which describes
+// what happens after the deadline, not a closed posting (#6620). "for" and "til"
+// are left out because they are also prepositions in both languages. So is
+// "etter" ("Søk etter stillinger"); see ETTER_BEFORE_MATCH for the one place a
+// bare "etter" opens the clause.
 const TIME_OR_CONDITION_CLAUSE =
-  /\b(?:until|till|once|when|whenever|after|before|unless|if|whether|as soon as) (?:[^\s.,;:!?…|•·]+ ){0,9}[^\s.,;:!?…|•·]+$/i;
+  /(?:\b(?:until|till|once|when|whenever|after|before|unless|if|whether|as soon as|nar|etter at|inntil|hvis|dersom|sa snart)|(?<![\p{L}\p{N}])før) (?:[^\s.,;:!?…|•·]+ ){0,9}[^\s.,;:!?…|•·]+$/iu;
+
+// A bare "etter" opens the clause only when the match itself starts at the
+// deadline noun right after it: "Søknader behandles etter søknadsfristen er
+// utløpt". A lookahead for the noun anywhere after "etter" also caught a sort
+// control: "Sorter etter søknadsfrist Stillingen er besatt", with the control
+// and the banner joined on one line, read the banner as part of a time clause
+// and the filled position as active (#6788).
+const ETTER_BEFORE_MATCH = /(?<![\p{L}\p{N}])etter $/iu;
+const DEADLINE_NOUN_START = /^s[øo]knadsfrist/iu;
+
+function opensTimeOrConditionClause(lines, match) {
+  const end = match.index + match[0].length;
+  if (TIME_OR_CONDITION_CLAUSE.test(lines.slice(0, end))) return true;
+  return DEADLINE_NOUN_START.test(match[0]) && ETTER_BEFORE_MATCH.test(lines.slice(0, match.index));
+}
 
 // `lines` keeps its line breaks (normalizeForMatch with keepLineBreaks). The
 // patterns match on the joined text, as every other check here does, so a
@@ -258,7 +343,7 @@ function firstStatedMatch(patterns, lines = '') {
   const text = lines.replace(/\n/g, ' ');
   return patterns.find((pattern) => {
     for (const match of text.matchAll(new RegExp(pattern, `${pattern.flags}g`))) {
-      if (!TIME_OR_CONDITION_CLAUSE.test(lines.slice(0, match.index + match[0].length))) return true;
+      if (!opensTimeOrConditionClause(lines, match)) return true;
     }
     return false;
   });
@@ -288,12 +373,21 @@ export function classifyLiveness({ status = 0, requestedUrl = '', finalUrl = '',
   // 429 belongs with 403/503: rate limiting is the board throttling US, never
   // evidence the posting is gone. Its body is a short "Too Many Requests", well
   // under MIN_CONTENT_CHARS, so without this it fell through to
-  // insufficient_content and read as `expired` — and an expired result is
+  // insufficient_content, which then read as `expired` — and an expired result is
   // written to scan-history as skipped_expired, whose URL every later scan
   // dedup-skips (indefinitely, unless scan_history.recheck_after_days is set).
   // Scanning harder is exactly what earns a 429, so this compounds.
   if (status === 403 || status === 429 || status === 503) {
     return { result: 'uncertain', code: 'access_blocked', reason: `HTTP ${status} (access blocked, likely anti-bot)` };
+  }
+  // 401 and 451 refuse the REQUEST, not the posting: a sign-in wall, and a
+  // posting withheld for legal reasons, usually by region. AGENTS.md: "a
+  // login/error page is unconfirmed, not closed". Both bodies are short error
+  // pages, so they fell through to insufficient_content and read as expired,
+  // which scan --verify writes as skipped_expired and later scans dedup-skip.
+  if (status === 401 || status === 451) {
+    const why = status === 401 ? 'sign-in required' : 'unavailable for legal reasons, usually by region';
+    return { result: 'uncertain', code: 'access_blocked', reason: `HTTP ${status} (${why})` };
   }
   // Any other 5xx is a transient origin error (502/504 gateway hiccups, 500s
   // during deploys), not evidence the posting is gone. Without this guard the
@@ -354,8 +448,17 @@ export function classifyLiveness({ status = 0, requestedUrl = '', finalUrl = '',
     return { result: 'expired', code: 'listing_page', reason: `pattern matched: ${listingPage.source}` };
   }
 
+  // A short page with no closure notice, no 404/410 and no apply control has
+  // not said the posting is closed: a client-rendered posting that has not
+  // painted, or a slow single-page app, reads the same way. Every closure this
+  // classifier trusts was checked above, so this is uncertain, not expired.
+  // AGENTS.md calls a loading placeholder unconfirmed, not closed, and an
+  // `expired` here was written to scan-history as skipped_expired by
+  // scan --verify, dedup-filtering a live posting out of later scans. The code
+  // stays `insufficient_content`: liveness-browser.mjs keys its hydration poll
+  // and retries on it, and isUnreadableVerdict() reads it.
   if (bodyText.trim().length < MIN_CONTENT_CHARS) {
-    return { result: 'expired', code: 'insufficient_content', reason: 'insufficient content — likely nav/footer only' };
+    return { result: 'uncertain', code: 'insufficient_content', reason: 'insufficient content — likely nav/footer only, or not rendered yet' };
   }
 
   return { result: 'uncertain', code: 'no_apply_control', reason: 'content present but no visible apply control found' };
@@ -370,14 +473,65 @@ const EXPIRED_HISTORY_STATUS = /expired/i;
 
 /**
  * True when a verdict means "the posting body could not be read", not "the
- * posting is closed". Today that condition is carried inside
- * `result: 'expired'` with `code: 'insufficient_content'` (nav/footer only, or
- * a body that sits in an unreadable iframe). Consumers that must not treat such
- * a verdict as closure call this instead of repeating the code string.
- * Detection only: it does not change what classifyLiveness returns.
+ * posting is closed": `code: 'insufficient_content'` (nav/footer only, or a
+ * body that sits in an unreadable iframe). classifyLiveness returns it as
+ * `uncertain`; consumers that may also see an older or hand-built verdict
+ * labelled `expired` with that code call this instead of repeating the code
+ * string. Detection only: it does not change what classifyLiveness returns.
  */
 export function isUnreadableVerdict(verdict) {
   return verdict?.code === 'insufficient_content';
+}
+
+/**
+ * Does this verdict prove the posting is CLOSED?
+ *
+ * `expired` alone does not. classifyLiveness now returns an
+ * `insufficient_content` verdict as `uncertain`, but an older or hand-built
+ * verdict can still carry that code under `expired`, and it means the body
+ * could not be read — a page still hydrating, a client-side render that never
+ * landed — not that the posting is gone (#5408). AGENTS.md is explicit that
+ * "an unreadable JD, loading placeholder, or login/error page is unconfirmed,
+ * not closed".
+ *
+ * One definition, because the rule used to be COPIED. The scan-history record
+ * planner and batch-evaluate-gemini.mjs each spelled it out as
+ * `result !== 'expired' || isUnreadableVerdict(...)`, and the third caller —
+ * check-liveness.mjs --discard-expired, the only one of the three that writes
+ * to the tracker — took every `expired` verdict and never applied it. So an
+ * Evaluated row whose page was merely slow to render was rewritten to
+ * Discarded with the note "posting closed". Routing all three through here is
+ * what stops a fourth caller drifting the same way.
+ *
+ * @param {{result?: string, code?: string}|null|undefined} verdict
+ * @returns {boolean}
+ */
+export function isClosureEvidence(verdict) {
+  return verdict?.result === 'expired' && !isUnreadableVerdict(verdict);
+}
+
+/**
+ * The URLs `--discard-expired` may close: only those with closure evidence.
+ *
+ * Kept pure and exported so the exact selection the CLI uses is testable
+ * without a browser.
+ *
+ * @param {Array<{url?: string, result?: string, code?: string}>} verdicts
+ * @returns {{closed: string[], unreadable: string[]}} `unreadable` is reported
+ *   rather than silently dropped, so the user can see why a row they expected
+ *   to close was left alone.
+ */
+export function discardableExpiredUrls(verdicts) {
+  const closed = [];
+  const unreadable = [];
+  for (const v of verdicts ?? []) {
+    if (!v?.url) continue;
+    if (isClosureEvidence(v)) closed.push(v.url);
+    // Not gated on `expired`: classifyLiveness returns an unreadable page as
+    // `uncertain`, and the user still needs to hear why that row stayed open.
+    else if (isUnreadableVerdict(v)) unreadable.push(v.url);
+  }
+  return { closed, unreadable };
 }
 
 /**
@@ -389,12 +543,12 @@ export function isUnreadableVerdict(verdict) {
  *   - **Only `expired`.** `uncertain` is a timeout or a bot wall, never a death
  *     certificate; recording it would bury a live posting behind a network
  *     hiccup, a strictly worse failure than the one this closes.
- *   - **Not an unrendered page.** The browser rung reads a page under 300
- *     characters with no closure notice and no apply control as
- *     `insufficient_content`, which is mostly a page that had not rendered yet.
- *     AGENTS.md calls a loading placeholder unconfirmed, not closed, and
- *     batch-evaluate-gemini.mjs skips the same code. A dead posting that reads
- *     this way gets no row, as it did before this recorder existed.
+ *   - **Not an unrendered page.** A page under 300 characters with no
+ *     closure notice and no apply control reads as `insufficient_content`,
+ *     which is mostly a page that had not rendered yet. classifyLiveness
+ *     returns it as `uncertain`, and the code is skipped here too, so a
+ *     verdict built elsewhere with `expired` and that code still writes no
+ *     row. AGENTS.md calls a loading placeholder unconfirmed, not closed.
  *   - **Only URLs the history already knows.** A liveness sweep is not a
  *     discovery channel: a URL scan-history never saw has no row to retire, and
  *     inventing one would put a posting nothing surfaced into the dedup set.
@@ -418,8 +572,8 @@ export function planExpiredHistoryRows(scanHistoryText = '', verdicts = [], norm
   const knownByKey = new Map(); // dedup key -> Map(verbatim url -> row fields)
   const recorded = new Set();   // verbatim urls that already carry an expired row
 
-  // slice(1) skips the header, the same convention collectSeenUrls uses.
-  for (const line of String(scanHistoryText ?? '').split('\n').slice(1)) {
+  // Line 0 only when it is the header, as collectSeenUrls reads it.
+  for (const line of scanHistoryDataLines(scanHistoryText)) {
     // parseScanHistoryLine undoes the formula escaping the writer applied. The
     // planned rows go back through appendToScanHistory, which escapes again, so
     // reading the stored cells raw added one more leading apostrophe to a title,
@@ -444,7 +598,7 @@ export function planExpiredHistoryRows(scanHistoryText = '', verdicts = [], norm
   const rows = [];
   const claimed = new Set();
   for (const verdict of verdicts ?? []) {
-    if (verdict?.result !== 'expired' || isUnreadableVerdict(verdict)) continue;
+    if (!isClosureEvidence(verdict)) continue;
     const candidate = typeof verdict.url === 'string' ? verdict.url.trim() : '';
     if (!candidate) continue;
     const known = knownByKey.get(normalizeUrl(candidate));

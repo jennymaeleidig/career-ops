@@ -23,13 +23,14 @@ import { join, dirname, resolve, extname } from 'path';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
-import { parseTrackerRow, resolveColumns, extractTrackerReportNumbers } from './tracker-parse.mjs';
+import { parseTrackerRow, resolveColumns, extractTrackerReportNumbers, linkedReportNumbers } from './tracker-parse.mjs';
 // The vocabulary this CLI accepts is also READ by calibrate.mjs, which cannot
 // import this file (top-level CLI, exits on load). Shared so the two cannot
 // drift — they already had (#3315 shipped a 7-entry copy of these 14).
 import { OUTCOME_MAP } from './lib/outcome-types.mjs';
 import { roleFuzzyMatch } from './role-matcher.mjs';
 import {
+  companiesMatchIgnoringCorporateForm,
   normalizeCompany,
   pathIsInsideCanonical,
   resolvePdfIndexPath,
@@ -41,7 +42,7 @@ import { localToday } from './lib/local-today.mjs';
 import { resolveOutcomeDir } from './lib/outcome-dir.mjs';
 import { acquireDirLock, releaseOrWarn } from './lib/dir-lock.mjs';
 import { parsePdfIndex } from './find.mjs';
-import { findCaptureForReport } from './jd-capture.mjs';
+import { captureSlug, findCaptureForReport } from './jd-capture.mjs';
 
 // Two roots. CODE_ROOT locates the sibling scripts this file shells out to and
 // is the cwd it runs them from; DATA_ROOT is where the user's tracker and
@@ -191,12 +192,32 @@ if (/^\d+$/.test(selector)) {
   }
 } else {
   const key = normalizeCompany(selector);
+  // The rule set-status.mjs applies, and this script hands it the write. An
+  // empty key (`?`, or a name in a script normalizeCompany folds away) names
+  // no company; it matched every row whose own key is empty.
+  if (!key) {
+    failExit(`Selector "${selector}" is empty after normalization — pass the tracker row # instead`, 'empty-selector', EXIT_USAGE);
+  }
   candidates = rows.filter(r => normalizeCompany(r.company) === key);
   if (candidates.length === 0) {
-    candidates = rows.filter(r => normalizeCompany(r.company).includes(key) || key.includes(normalizeCompany(r.company)));
+    // The same employer under another corporate form ("Acme" for "Acme
+    // Corp"), by the rule dedup-tracker and merge-tracker use. This was a raw
+    // substring test: `key.includes('')` is true for every blind-employer `?`
+    // row, so an outcome for a company never tracked was recorded on one of
+    // them, and "Meta" selected "Metabase". set-status cannot catch either,
+    // since it receives this row's own number and role.
+    candidates = rows.filter(r => companiesMatchIgnoringCorporateForm(selector, r.company));
   }
   if (candidates.length === 0) {
-    failExit(`No tracker row for company matching "${selector}"`, 'company-not-found', EXIT_NOT_FOUND);
+    // A near miss is offered, never selected.
+    const near = rows.filter(r => {
+      const rowKey = normalizeCompany(r.company);
+      return rowKey && (rowKey.includes(key) || key.includes(rowKey));
+    }).slice(0, 3);
+    const hint = near.length
+      ? ` — did you mean ${near.map(r => `#${r.num} ${r.company}`).join(' or ')}? Pass the row # to select it`
+      : '';
+    failExit(`No tracker row for company matching "${selector}"${hint}`, 'company-not-found', EXIT_NOT_FOUND);
   }
 }
 
@@ -470,7 +491,29 @@ if (flags.cover && existsSync(flags.cover)) {
 // 3. Archive job posting or write explicit stub, preserving existing files instead of overwriting.
 let postingArchived = false;
 let resolvedPostingPath = null;
-const targetUrl = flags.url || (matchedRow.notes && matchedRow.notes.match(/https?:\/\/[^\s|)]+/)?.[0]);
+// The tracker's URL column before Notes: merge-tracker writes a row's posting
+// URL there (#3516), not in Notes, so a row it added had no URL to archive
+// from and got a "None provided" stub. A placeholder cell ("—", "N/A") names
+// no posting and is skipped.
+const cellUrl = /^https?:\/\//i.test(matchedRow.url || '') ? matchedRow.url : null;
+const targetUrl = flags.url || cellUrl || (matchedRow.notes && matchedRow.notes.match(/https?:\/\/[^\s|)]+/)?.[0]);
+// Captures are keyed by REPORT number: archive-posting --report=N names them
+// `{N}-…`, jd-capture.mjs looks them up that way, and the PDF lookup above
+// already keys by it. matchedRow.num is the TRACKER #, and the two differ once
+// any row has no report, so an existing capture was never found and a new one
+// was filed under another application's number. A row without exactly one
+// self-consistent report link keeps the tracker # it was keyed by before.
+const linkedReports = linkedReportNumbers(matchedRow.report, matchedRow.notes);
+const captureKey = linkedReports.length === 1 ? linkedReports[0] : matchedRow.num;
+// A capture carries the company slug archive-posting.mjs wrote, captureSlug(),
+// so the lookup uses that slug and not this file's slugify(). The two agree on
+// a Latin name, but slugify() turns one written only in another script
+// (株式会社アクメ, Яндекс) into 'unknown', which no capture carries: the posting
+// was never found, and each run asked archive-posting for it again. A name with
+// no letter or digit at all, such as the `?` placeholder employer, has no slug,
+// so it still looks for 'unknown': the name archive-posting gives a posting
+// whose company it could not detect.
+const captureCompanySlug = captureSlug(matchedRow.company) || 'unknown';
 
 // Case 1: Check if there's already an archived posting link in the notes column
 const notesLink = matchedRow.notes && matchedRow.notes.match(/local:(jds\/[^\s|)]+)/)?.[1];
@@ -486,8 +529,8 @@ if (notesLink) {
 // made on any earlier day, and postings whose URL has since gone dead — the case
 // the archive exists for, and the one a same-day filename rebuild cannot serve.
 if (!resolvedPostingPath) {
-  const found = findCaptureForReport(resolve(repoRoot, 'jds'), matchedRow.num, {
-    companySlug: slugify(matchedRow.company),
+  const found = findCaptureForReport(resolve(repoRoot, 'jds'), captureKey, {
+    companySlug: captureCompanySlug,
   });
   if (found) {
     resolvedPostingPath = found.path;
@@ -498,14 +541,14 @@ if (!resolvedPostingPath) {
 // Case 3: Archive the posting now, keyed to the report so it resolves next time.
 if (!resolvedPostingPath && targetUrl) {
   try {
-    execFileSync(NODE, [ARCHIVE_POSTING_SCRIPT, targetUrl, `--company=${matchedRow.company}`, `--role=${matchedRow.role}`, `--report=${matchedRow.num}`], {
+    execFileSync(NODE, [ARCHIVE_POSTING_SCRIPT, targetUrl, `--company=${matchedRow.company}`, `--role=${matchedRow.role}`, `--report=${captureKey}`], {
       cwd: CODE_ROOT,
       env: process.env,
       stdio: 'ignore',
       timeout: 45000,
     });
-    const found = findCaptureForReport(resolve(repoRoot, 'jds'), matchedRow.num, {
-      companySlug: slugify(matchedRow.company),
+    const found = findCaptureForReport(resolve(repoRoot, 'jds'), captureKey, {
+      companySlug: captureCompanySlug,
     });
     if (found) {
       resolvedPostingPath = found.path;

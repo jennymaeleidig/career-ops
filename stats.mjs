@@ -25,7 +25,7 @@ import { fileURLToPath } from 'url';
 import { loadYaml } from './lib/yaml-document.mjs';
 import { localToday } from './lib/local-today.mjs';
 import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
-import { normalizeStatus, analyzeFromContent } from './followup-cadence.mjs';
+import { normalizeStatus, analyzeFromContent, loadFollowupsEnabled } from './followup-cadence.mjs';
 import { getCareerOpsRoot, resolveTrackerPath } from './path-resolver.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
 import { parseStatusLogStages, recoverFunnelStages } from './funnel-stages.mjs';
@@ -299,6 +299,12 @@ export function scanCompanyNames(content) {
  * `name` and the scanner's company string; that undercounts when names differ
  * ("Acme" vs "Acme, Inc."). Documented v1 contract — no silent fuzzy-matching.
  *
+ * configuredCompanies counts every tracked_companies entry, disabled ones
+ * included; enabledCompanies is the distinct enabled names producingPct
+ * divides by. They differ whenever an entry is disabled, as many are in the
+ * shipped template, so a reader handed only the first would see a percentage
+ * that does not divide out from the counts beside it.
+ *
  * @param {string} portalsYmlContent - Raw portals.yml text.
  * @param {object|null} scanStats - Result of computeScanStats (for activePortals).
  * @param {string[]} [producingCompanyNames] - From scanCompanyNames().
@@ -312,8 +318,13 @@ export function computePortalStats(portalsYmlContent, scanStats, producingCompan
   }
   const companies = Array.isArray(cfg.tracked_companies) ? cfg.tracked_companies : [];
   const boards = Array.isArray(cfg.job_boards) ? cfg.job_boards : [];
+  // Only enabled entries count as configured: a disabled entry writes no new
+  // health rows (resolveEntries skips it), so counting it here would let its
+  // final failure streak light the 🚨 forever in a way no fix can clear — the
+  // same trap documented below for probe staleness.
+  const enabledEntries = companies.filter((c) => c?.enabled !== false);
   const configuredNames = new Set(
-    companies.map((c) => String(c?.name || '').toLowerCase()).filter(Boolean),
+    enabledEntries.map((c) => String(c?.name || '').toLowerCase()).filter(Boolean),
   );
   const producing = new Set(producingCompanyNames.map((n) => String(n).toLowerCase()));
   let producingCompanies = 0;
@@ -335,9 +346,10 @@ export function computePortalStats(portalsYmlContent, scanStats, producingCompan
     const lastProbed = new Map();
     let newestProbe = 0;
     for (const r of healthRecords) {
-      // Mirrors scan.mjs computeConsecutiveFailures: healthy statuses reset,
-      // every other status (slug_gone/network/auth/server/unknown) counts.
-      if (r.status === 'reachable' || r.status === 'empty') {
+      // Mirrors scan.mjs computeConsecutiveFailures: reached statuses reset
+      // (a `partial` board answered, it was only cut short), every other
+      // status (slug_gone/network/auth/server/unknown) counts.
+      if (r.status === 'reachable' || r.status === 'empty' || r.status === 'partial') {
         streaks.set(r.company, 0);
       } else {
         streaks.set(r.company, (streaks.get(r.company) || 0) + 1);
@@ -372,6 +384,7 @@ export function computePortalStats(portalsYmlContent, scanStats, producingCompan
 
   return {
     configuredCompanies: companies.length,
+    enabledCompanies: configuredNames.size,
     configuredBoards: boards.length,
     activePortals: Object.keys(scanStats?.byPortal || {}).length,
     producingCompanies,
@@ -406,7 +419,7 @@ export function computePortalRecommendations(portalsContent, scanContent, health
   const healthRows = [];
   for (const line of String(healthContent ?? '').split('\n')) {
     const [date, company, status] = line.trimEnd().split('\t');
-    if (!validDate(date) || !company || !['reachable', 'empty', 'slug_gone', 'network', 'auth', 'server', 'unknown'].includes(status)) continue;
+    if (!validDate(date) || !company || !['reachable', 'empty', 'slug_gone', 'network', 'auth', 'server', 'unknown', 'partial'].includes(status)) continue;
     healthRows.push({ date, company, status });
   }
   healthRows.sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
@@ -416,7 +429,8 @@ export function computePortalRecommendations(portalsContent, scanContent, health
     h.firstObserved = date < h.firstObserved ? date : h.firstObserved;
     h.lastObserved = date;
     h.status = status;
-    h.streak = status === 'reachable' || status === 'empty' ? 0 : h.streak + 1;
+    // `partial` resets like reachable: the board answered (scan.mjs agrees).
+    h.streak = status === 'reachable' || status === 'empty' || status === 'partial' ? 0 : h.streak + 1;
     health.set(key, h);
   }
   const buckets = { neverProduced: [], rotted: [], healthyButQuiet: [] };
@@ -686,7 +700,7 @@ export function computeAllStats({
 }
 
 /** Human-readable table. pdfPct/reportPct are JSON-only by design — no job-search decision follows from them. */
-function printSummary(stats) {
+function printSummary(stats, { followupsEnabled = true } = {}) {
   const line = '━'.repeat(45);
   console.log(`\n${line}`);
   console.log(`Pipeline Stats — ${stats.metadata.generatedAt}`);
@@ -698,8 +712,11 @@ function printSummary(stats) {
       : '';
     // Only break out live/cold when there's a cold row to report — with no
     // follow-up data (or genuinely zero cold rows) the plain count is exactly
-    // as accurate and the parenthetical would be noise.
-    const liveInfo = t.activeAppsCold > 0 ? ` (${t.activeAppsLive} live, ${t.activeAppsCold} cold)` : '';
+    // as accurate and the parenthetical would be noise. 'Cold' is a follow-up
+    // cadence verdict, so it goes too when follow-ups are off: the Follow-ups
+    // line below says they are, and followup-cadence.mjs reports no cold rows
+    // then. JSON is unchanged, as for the follow-up line (#5710).
+    const liveInfo = followupsEnabled && t.activeAppsCold > 0 ? ` (${t.activeAppsLive} live, ${t.activeAppsCold} cold)` : '';
     console.log(`Tracker:    ${t.total} total | ${t.activeApps} active${liveInfo}${fit}`);
     const statusLine = Object.entries(t.byStatus).filter(([, c]) => c > 0).map(([s, c]) => `${s} ${c}`).join(' · ');
     if (statusLine) console.log(`Status:     ${statusLine}`);
@@ -722,12 +739,14 @@ function printSummary(stats) {
   const p = stats.portals;
   if (p) {
     const deadPart = p.persistentlyDead > 0 ? ` | 🚨 ${p.persistentlyDead} persistently dead (run verify-portals.mjs)` : '';
-    console.log(`Portals:    ${p.configuredCompanies} companies + ${p.configuredBoards} boards configured | ${p.producingCompanies} have produced a match (${p.producingPct}%)${deadPart} — low ≠ broken, may just be no openings`);
+    console.log(`Portals:    ${p.configuredCompanies} companies + ${p.configuredBoards} boards configured | ${p.producingCompanies} of ${p.enabledCompanies} enabled have produced a match (${p.producingPct}%)${deadPart} — low ≠ broken, may just be no openings`);
   } else {
     console.log('Portals:    — no data (portals.yml missing)');
   }
   const fu = stats.followups;
-  if (fu) {
+  if (!followupsEnabled) {
+    console.log('Follow-ups: turned off (follow_ups.enabled: false in config/profile.yml)');
+  } else if (fu) {
     console.log(`Follow-ups: ${fu.totalFollowups} sent across ${fu.appsWithFollowups} apps | ${fu.appliedWithoutFollowup} Applied apps with none | avg ${fu.avgPerApp}/app`);
   } else {
     console.log('Follow-ups: — no data (data/follow-ups.md missing)');
@@ -778,6 +797,6 @@ if (isMainModule(import.meta.url)) {
   validateFlags(args, KNOWN_FLAGS, USAGE);
 
   const stats = computeAllStats({ prune: args.includes('--prune') });
-  if (args.includes('--summary')) printSummary(stats);
+  if (args.includes('--summary')) printSummary(stats, { followupsEnabled: loadFollowupsEnabled() });
   else console.log(JSON.stringify(stats, null, 2));
 }

@@ -22,6 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { structuredFieldClaims, verifyFacts } from '../verify-cv-facts.mjs';
+import { describeSpawn } from './helpers/describe-spawn.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const tmp = mkdtempSync(join(tmpdir(), 'career-ops-structured-facts-'));
@@ -52,7 +53,7 @@ function build(script, payload, ext) {
   const output = `${input}.${ext}`;
   writeFileSync(input, JSON.stringify(payload));
   const run = spawnSync(process.execPath, [join(ROOT, script), input, output], { encoding: 'utf-8' });
-  assert.equal(run.status, 0, `${script} failed: ${run.stderr}${run.stdout}`);
+  assert.equal(run.status, 0, describeSpawn(run, `${script} failed`));
   return readFileSync(output, 'utf-8');
 }
 
@@ -149,3 +150,197 @@ test('skills lists are not structured claims', () => {
   }, 'html');
   assert.equal(verifyFacts(html, options()).verdict, 'pass', 'rewording a skill is the tailoring the gate allows');
 });
+
+test('a nowrap span inside a title keeps its hyphenated word (#5632)', () => {
+  // generate-pdf wraps hyphenated words in an unclassed nowrap span before the
+  // gate runs; reading that span as a nested field dropped "Full-Stack".
+  const claims = structuredFieldClaims(
+    '<div class="job-role">Senior <span style="white-space:nowrap">Full-Stack</span> Engineer</div>');
+  assert.deepEqual(kinds(claims), ['title=senior full-stack engineer']);
+});
+
+test('a nowrap span inside an edu-title keeps its word and separates edu-org (#5632)', () => {
+  const claims = structuredFieldClaims(
+    '<div class="edu-title">M.Sc. <span style="white-space:nowrap">Human-Computer</span> Interaction <span class="edu-org">State University</span></div>');
+  assert.deepEqual(kinds(claims), [
+    'education=m.sc. human-computer interaction',
+    'education=state university',
+  ]);
+});
+
+test('a span structured field containing a nowrap span does not close early (#5632)', () => {
+  const claims = structuredFieldClaims(
+    '<span class="job-company">The <span style="white-space:nowrap">Coca-Cola</span> Company</span>');
+  assert.deepEqual(kinds(claims), ['employer=the coca-cola company']);
+});
+
+test('nested edu-org with inner nowrap span is completely removed from edu-title (#5632)', () => {
+  const claims = structuredFieldClaims(
+    '<div class="edu-title">M.Sc. <span style="white-space:nowrap">Human-Computer</span> Interaction <span class="edu-org">The <span style="white-space:nowrap">State-University</span> of New York</span></div>');
+  assert.deepEqual(kinds(claims), [
+    'education=m.sc. human-computer interaction',
+    'education=the state-university of new york',
+  ]);
+});
+
+
+
+test('a claim that spans markdown links reads the link text, not the link targets', () => {
+  const linked = join(tmp, 'cv-linked.md');
+  writeFileSync(linked, `${CV}
+## Previous Experience
+***[*Fabrikam*](https://fabrikam.example/) *(Director),* [*Contoso*](http://contoso.example/) *(Engineer)*
+`);
+  const html = build('build-cv-html.mjs', {
+    candidate: { name: 'Jane Doe' },
+    summary: 'Engineer.',
+    experience: [
+      { company: 'Acme Corp', role: 'Senior Software Engineer', dates: '2019 – 2024', bullets: ['Led a team of 4 engineers.'] },
+      { company: 'Previous Experience', role: 'Fabrikam (Director), Contoso (Engineer)', dates: '', bullets: [] },
+    ],
+    skills: [{ category: 'Languages', items: 'Python, Go' }],
+  }, 'html');
+  const result = verifyFacts(html, { sourcePaths: [linked], configPath: join(tmp, 'none.json') });
+  const flagged = [...result.unsupportedFacts, ...result.advisoryFacts].map(({ value }) => value);
+  assert.deepEqual(flagged.filter(value => /fabrikam|contoso/.test(value)), []);
+});
+
+test('a title the linked source does not hold is still flagged', () => {
+  const linked = join(tmp, 'cv-linked2.md');
+  writeFileSync(linked, `${CV}
+## Previous Experience
+[Fabrikam](https://fabrikam.example/) (Director)
+`);
+  const html = build('build-cv-html.mjs', {
+    candidate: { name: 'Jane Doe' },
+    summary: 'Engineer.',
+    experience: [
+      { company: 'Acme Corp', role: 'Senior Software Engineer', dates: '2019 – 2024', bullets: ['Led a team of 4 engineers.'] },
+      { company: 'Previous Experience', role: 'Fabrikam (Vice President)', dates: '', bullets: [] },
+    ],
+    skills: [{ category: 'Languages', items: 'Python, Go' }],
+  }, 'html');
+  const result = verifyFacts(html, { sourcePaths: [linked], configPath: join(tmp, 'none.json') });
+  const flagged = [...result.unsupportedFacts, ...result.advisoryFacts].map(({ value }) => value);
+  assert.ok(flagged.some(value => /vice president/.test(value)));
+});
+
+test('emphasis in a second source file does not leave a stray asterisk in the first', () => {
+  const a = join(tmp, 'cv-a.md');
+  const b = join(tmp, 'digest-b.md');
+  writeFileSync(a, `${CV}
+## Previous Experience
+***[*Fabrikam*](https://fabrikam.example/) *(Director),* [*Contoso*](http://contoso.example/) *(Engineer)*
+`);
+  writeFileSync(b, '# Digest\n\n**Led** the migration of 3 systems.\n');
+  const html = build('build-cv-html.mjs', {
+    candidate: { name: 'Jane Doe' },
+    summary: 'Engineer.',
+    experience: [
+      { company: 'Acme Corp', role: 'Senior Software Engineer', dates: '2019 – 2024', bullets: ['Led a team of 4 engineers.'] },
+      { company: 'Previous Experience', role: 'Fabrikam (Director), Contoso (Engineer)', dates: '', bullets: [] },
+    ],
+    skills: [{ category: 'Languages', items: 'Python, Go' }],
+  }, 'html');
+  const result = verifyFacts(html, { sourcePaths: [a, b], configPath: join(tmp, 'none.json') });
+  const flagged = [...result.unsupportedFacts, ...result.advisoryFacts].map(({ value }) => value);
+  assert.deepEqual(flagged.filter(value => /fabrikam|contoso/.test(value)), []);
+});
+
+for (const [label, linked] of [
+  ['a target with nested parentheses', '[Fabrikam](https://en.wikipedia.org/wiki/Foo_(bar)) (Director), [Contoso](http://contoso.example/) (Engineer)'],
+  ['a link title', '[Fabrikam](https://fabrikam.example/ "Fabrikam home") (Director), [Contoso](http://contoso.example/ \'Contoso\') (Engineer)'],
+  ['reference-style links', '[Fabrikam][ml] (Director), [Contoso][] (Engineer)\n\n[ml]: https://fabrikam.example/ "Fabrikam"\n[Contoso]: http://contoso.example/'],
+]) {
+  test(`a claim spanning ${label} reads the link text`, () => {
+    const linked_ = join(tmp, `cv-${Math.random().toString(36).slice(2)}.md`);
+    writeFileSync(linked_, `${CV}\n## Previous Experience\n${linked}\n`);
+    const html = build('build-cv-html.mjs', {
+      candidate: { name: 'Jane Doe' },
+      summary: 'Engineer.',
+      experience: [
+        { company: 'Acme Corp', role: 'Senior Software Engineer', dates: '2019 – 2024', bullets: ['Led a team of 4 engineers.'] },
+        { company: 'Previous Experience', role: 'Fabrikam (Director), Contoso (Engineer)', dates: '', bullets: [] },
+      ],
+      skills: [{ category: 'Languages', items: 'Python, Go' }],
+    }, 'html');
+    const result = verifyFacts(html, { sourcePaths: [linked_], configPath: join(tmp, 'none.json') });
+    const flagged = [...result.unsupportedFacts, ...result.advisoryFacts].map(({ value }) => value);
+    assert.deepEqual(flagged.filter(value => /fabrikam|contoso/.test(value)), []);
+  });
+}
+
+test('a reference definition does not swallow the next line as its title', () => {
+  const linked = join(tmp, 'cv-refdef.md');
+  writeFileSync(linked, `${CV}
+## Previous Experience
+[Fabrikam][ml]
+
+[ml]: https://fabrikam.example/
+
+(Director)
+`);
+  const html = build('build-cv-html.mjs', {
+    candidate: { name: 'Jane Doe' },
+    summary: 'Engineer.',
+    experience: [
+      { company: 'Acme Corp', role: 'Senior Software Engineer', dates: '2019 – 2024', bullets: ['Led a team of 4 engineers.'] },
+      { company: 'Fabrikam', role: 'Director', dates: '', bullets: [] },
+    ],
+    skills: [{ category: 'Languages', items: 'Python, Go' }],
+  }, 'html');
+  const result = verifyFacts(html, { sourcePaths: [linked], configPath: join(tmp, 'none.json') });
+  const flagged = [...result.unsupportedFacts, ...result.advisoryFacts].map(({ value }) => value);
+  assert.deepEqual(flagged.filter(value => /director|fabrikam/.test(value)), []);
+});
+
+test('a reference definition title on the next line is not evidence', () => {
+  const linked = join(tmp, 'cv-refdef2.md');
+  writeFileSync(linked, `${CV}
+## Previous Experience
+[Fabrikam][ml]
+
+[ml]: https://fabrikam.example/
+(Director)
+`);
+  const html = build('build-cv-html.mjs', {
+    candidate: { name: 'Jane Doe' },
+    summary: 'Engineer.',
+    experience: [
+      { company: 'Acme Corp', role: 'Senior Software Engineer', dates: '2019 – 2024', bullets: ['Led a team of 4 engineers.'] },
+      { company: 'Fabrikam', role: 'Director', dates: '', bullets: [] },
+    ],
+    skills: [{ category: 'Languages', items: 'Python, Go' }],
+  }, 'html');
+  const result = verifyFacts(html, { sourcePaths: [linked], configPath: join(tmp, 'none.json') });
+  const flagged = [...result.unsupportedFacts, ...result.advisoryFacts].map(({ value }) => value);
+  assert.ok(flagged.some(value => /director/.test(value)), 'the title text is not claimed as the role');
+  assert.deepEqual(flagged.filter(value => /fabrikam/.test(value)), []);
+});
+
+for (const [label, linked] of [
+  ['a nested-parenthesis target', '[Fabrikam](https://fabrikam.example/x_(Director))'],
+  ['an escaped-parenthesis target', '[Fabrikam](https://fabrikam.example/x\\)(Director))'],
+  ['an inline link title', '[Fabrikam](https://fabrikam.example/ "Director")'],
+  ['a same-line reference-definition title', '[Fabrikam][ml]\n\n[ml]: https://fabrikam.example/ "Director"'],
+  ['a reference-definition target on the line after its label', '[Fabrikam][ml]\n\n[ml]:\n  https://fabrikam.example/x_(Director)'],
+  ['a reference-definition target in angle brackets holding a space', '[Fabrikam][ml]\n\n[ml]: <./fabrikam/x (Director).pdf>'],
+]) {
+  test(`a role that appears only in ${label} is not evidence`, () => {
+    const source = join(tmp, `cv-meta-${Math.random().toString(36).slice(2)}.md`);
+    writeFileSync(source, `${CV}\n## Previous Experience\n${linked}\n`);
+    const html = build('build-cv-html.mjs', {
+      candidate: { name: 'Jane Doe' },
+      summary: 'Engineer.',
+      experience: [
+        { company: 'Acme Corp', role: 'Senior Software Engineer', dates: '2019 – 2024', bullets: ['Led a team of 4 engineers.'] },
+        { company: 'Fabrikam', role: 'Director', dates: '', bullets: [] },
+      ],
+      skills: [{ category: 'Languages', items: 'Python, Go' }],
+    }, 'html');
+    const result = verifyFacts(html, { sourcePaths: [source], configPath: join(tmp, 'none.json') });
+    const flagged = [...result.unsupportedFacts, ...result.advisoryFacts].map(({ value }) => value);
+    assert.ok(flagged.some(value => /director/.test(value)), 'the metadata-only role is flagged');
+    assert.deepEqual(flagged.filter(value => /fabrikam/.test(value)), []);
+  });
+}
