@@ -74,7 +74,6 @@ import { BROWSER_LIKE_USER_AGENT, fetchTextWithRetry, sleep } from './_http.mjs'
 import { decodeEntities } from './_html-entities.mjs';
 
 const INDEX_URL = 'https://www.wordsofmouth.org/archive';
-const INDEX_HOST = 'www.wordsofmouth.org';
 
 /** Issue-page hosts, allowlisted because every issue URL comes from scraped HTML. */
 const ISSUE_HOSTS = new Set(['wordsofmouth.beehiiv.com', 'mailchi.mp']);
@@ -182,7 +181,7 @@ export function normalizeIssueHref(raw) {
 function plainText(fragment) {
   const marked = String(fragment ?? '').replace(ANCHOR_RE, (_all, attrs, inner) =>
     `${LINK_OPEN}${hrefFromAttrs(attrs)}${LINK_MID}${plainText(inner)}${LINK_CLOSE}`);
-  return decodeEntities(marked.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+  return decodeEntities(marked.replace(/<[^>]*(>?)/g, (tag, close) => (close ? ' ' : tag))).replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -195,14 +194,14 @@ function plainText(fragment) {
  */
 export function toLabelText(html) {
   const marked = String(html ?? '').replace(ANCHOR_RE, (_all, attrs, inner) => {
-    const text = String(inner ?? '').replace(/<[^>]*>/g, ' ');
+    const text = String(inner ?? '').replace(/<[^>]*(>?)/g, (tag, close) => (close ? ' ' : tag));
     return `${LINK_OPEN}${hrefFromAttrs(attrs)}${LINK_MID}${text}${LINK_CLOSE}`;
   });
   const blocky = marked.replace(
     /<\/?(?:p|div|br|hr|li|ul|ol|tr|td|th|table|tbody|thead|h[1-6]|blockquote|section|article)\b[^>]*>/gi,
     '\n',
   );
-  return decodeEntities(blocky.replace(/<[^>]*>/g, ' ')).replace(/[ \t\u00a0]+/g, ' ');
+  return decodeEntities(blocky.replace(/<[^>]*(>?)/g, (tag, close) => (close ? ' ' : tag))).replace(/[ \t\u00a0]+/g, ' ');
 }
 
 /**
