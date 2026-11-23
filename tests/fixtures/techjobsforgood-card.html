@@ -1,0 +1,50 @@
+<!-- Trimmed live-shape per-posting card for the techjobsforgood provider tests.
+     The schema.org JobPosting JSON-LD block is the liveness signal (an expired
+     posting is a 200 shell with none), and the employer apply URL is inline in
+     the window.open(...) call. Fictional employer and ATS host. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Programs Director — Tech Jobs for Good</title>
+  <script type="application/ld+json">
+  {
+    "@context": "http://schema.org/",
+    "@type": "JobPosting",
+    "datePosted": "2026-10-01",
+    "description": "<h3>Overview</h3><p>Build &amp; ship <strong>accessible</strong> tools for the movement, and keep the team&rsquo;s data systems honest.</p>",
+    "hiringOrganization": {
+      "@type": "Organization",
+      "name": "Acme Nonprofit",
+      "sameAs": "https://acme.example.org"
+    },
+    "title": "Programs Director",
+    "employmentType": "FULL_TIME",
+    "validThrough": "2026-11-01",
+    "baseSalary": {
+      "@type": "MonetaryAmount",
+      "currency": "USD",
+      "value": {
+        "@type": "QuantitativeValue",
+        "minValue": 90000,
+        "maxValue": 110000,
+        "unitText": "YEAR"
+      }
+    },
+    "jobLocationType": "TELECOMMUTE",
+    "applicantLocationRequirements": { "@type": "Country", "name": "USA" }
+  }
+  </script>
+</head>
+<body>
+  <div id="job-detail">
+    <h1>Programs Director</h1>
+  </div>
+  <script>
+    $(document).ready(function () {
+      $("#apply-job").on("click", function () {
+        window.open('https://ats.example.org/acme/jobs/123?gh_src=TechJobsForGood', target = '_blank');
+      });
+    });
+  </script>
+</body>
+</html>

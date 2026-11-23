@@ -1,0 +1,20 @@
+<!-- Trimmed expired-posting shell for the techjobsforgood provider tests.
+     A dead posting answers HTTP 200 with this empty shape and NO JobPosting
+     JSON-LD block (measured live: ~29 KB, zero occurrences of JobPosting).
+     Liveness is the block's presence, never the status code. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Job Not Found — Tech Jobs for Good</title>
+</head>
+<body>
+  <div id="job-detail" class="ui container"></div>
+  <script>
+    $(document).ready(function () {
+      $("#apply-job").on("click", function () {
+        window.open('', target = '_blank');
+      });
+    });
+  </script>
+</body>
+</html>
